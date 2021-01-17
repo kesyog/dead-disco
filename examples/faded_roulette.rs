@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-
+/// LED roulette with fade on/off using the timer peripheral's output capture
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
 use cortex_m_rt::entry;
@@ -25,9 +25,9 @@ use stm32f3xx_hal as hal;
 // Compass: I2C
 // Gyroscope: SPI
 
-struct LedRoulette {
+struct LedRoulette<'a> {
     leds: DiscoLeds,
-    timer: hal::timer::Timer<pac::TIM2>,
+    timer: &'a mut pac::tim2::RegisterBlock,
 }
 
 static LEDS: Mutex<RefCell<Option<LedRoulette>>> = Mutex::new(RefCell::new(None));
@@ -64,11 +64,22 @@ fn main() -> ! {
     let gpioe = dp.GPIOE.split(&mut rcc.ahb);
     let leds = DiscoLeds::new(gpioe);
 
-    let mut timer = stm32f3xx_hal::timer::Timer::tim2(dp.TIM2, 100.khz(), clocks, &mut rcc.apb1);
+    // Frequency set to give
+    let mut tim2_hal = stm32f3xx_hal::timer::Timer::tim2(dp.TIM2, 500.hz(), clocks, &mut rcc.apb1);
 
     cortex_m::interrupt::free(|cs| {
-        timer.listen(hal::timer::Event::Update);
-        LEDS.borrow(cs).replace(Some(LedRoulette { leds, timer }));
+        tim2_hal.listen(hal::timer::Event::Update);
+        let tim2 = unsafe { &mut *(pac::TIM2::ptr() as *mut pac::tim2::RegisterBlock) };
+        // Enable compare 1 and 2 interrupts
+        tim2.dier
+            .modify(|_, w| w.cc1ie().set_bit().cc2ie().set_bit());
+        // Set initial duty cycle of previously-active LED to 100%
+        tim2.ccr2.write(|w| w.ccr().bits(u32::MAX));
+        // Enable buffering of new duty cycle values to avoid glitches
+        tim2.ccmr1_output_mut()
+            .modify(|_, w| w.oc1pe().set_bit().oc2pe().set_bit());
+        LEDS.borrow(cs)
+            .replace(Some(LedRoulette { leds, timer: tim2 }));
     });
 
     loop {
@@ -76,14 +87,20 @@ fn main() -> ! {
     }
 }
 
-struct LedState {
-    /// index into LED array
+/// Container to help track LED brightness
+///
+/// At any given point in the cycle, one LED is fading in. Define this to be the "active" LED.
+/// Another LED--the last LED to be active---is fading out.
+struct ActiveLed {
+    /// index into LED array of the active LED
     index: u8,
     /// duty cycle on a 0-255 scale
+    /// TODO: pre-compute steps to avoid floating-point math
     duty_cycle: f32,
 }
 
-impl LedState {
+impl ActiveLed {
+    /// Increase duty cycle by a given step. Duty cycle is on a scale of 0-255.
     fn step_duty(&mut self, step: f32) {
         self.duty_cycle += step;
         if self.duty_cycle > 255.0_f32 {
@@ -91,10 +108,17 @@ impl LedState {
         }
     }
 
-    fn duty(&self) -> f32 {
-        self.duty_cycle
+    /// Get gamma-corrected duty-cycle on a 0-255 scale
+    fn duty(&self) -> u32 {
+        u32::from(GAMMA[self.duty_cycle.round() as usize])
     }
 
+    /// Get index of active LED
+    fn index(&self) -> u8 {
+        self.index
+    }
+
+    /// Get index of the previously-active LED
     fn prev_led_idx(&self) -> u8 {
         if self.index > 0 {
             self.index - 1
@@ -103,68 +127,88 @@ impl LedState {
         }
     }
 
-    fn prev_led_duty(&self) -> f32 {
-        255.0_f32 - self.duty_cycle
+    /// Get the gamma-corrected duty-cycle of the previously-active LED
+    fn prev_led_duty(&self) -> u32 {
+        u32::from(GAMMA[(255.0_f32 - self.duty_cycle).round() as usize])
+    }
+
+    /// Rotate which LED is the active LED
+    fn rotate_active_led(&mut self) {
+        self.index += 1;
+        if self.index == 8 {
+            self.index = 0;
+        }
+    }
+
+    /// Set the active LED's duty cycle to 0
+    fn reset_duty(&mut self) {
+        self.duty_cycle = 0.0;
     }
 }
 
 /// Fade LED's on and off sequentially.
 ///
-/// Use timer periods as a time base, tracked by COUNT
-/// LED's are PWMed with a period of 256 timer periods so that we can set duty cycle with 8-bit
-/// resolution.
-/// Potential huge future improvement: most of the time this interrupt runs, nothing happens. We
-/// should be able to use the output capture interrupts for duty cycle such that we only interrupt
-/// when we have to.
-///
-/// At any given point in the cycle, one LED is fading in. Define this to be the "active" LED.
-/// Another LED--the last LED to be active---is fading out.
+/// LED brightness is controlled by PWM using TIM2. The output compares, 1 and 2, are set such their
+/// interrupts trigger when the "LED on" portion of a duty cycle expires each period for the active
+/// LED and previously-active LED, respectively.
 #[interrupt]
 fn TIM2() {
-    static mut ACTIVE_LED: LedState = LedState {
+    static mut ACTIVE_LED: ActiveLed = ActiveLed {
         index: 0,
         duty_cycle: 0.0,
     };
     static mut COUNT: u32 = 0;
 
     // How long each LED will fade in (and out), in units of timer periods
-    const FADE_IN_DURATION: u32 = 25000;
-
-    *COUNT += 1;
+    const FADE_IN_DURATION: u32 = 375;
 
     cortex_m::interrupt::free(|cs| {
         let mut state = LEDS.borrow(cs).borrow_mut();
         let state = state.as_mut().unwrap();
 
-        let t = (*COUNT % 256) as u8;
-        if t == 0 {
-            const DUTY_STEP: f32 = 255.0 / (FADE_IN_DURATION as f32 / 256.0);
-            ACTIVE_LED.step_duty(DUTY_STEP);
+        let tim2 = &state.timer;
+        let period = tim2.arr.read().arr().bits();
 
-            if GAMMA[ACTIVE_LED.duty().round() as usize] != 0 {
-                state.leds[ACTIVE_LED.index].set_high().ok();
+        // Period expired
+        if tim2.sr.read().uif().bit_is_set() {
+            tim2.sr.modify(|_, w| w.uif().clear());
+
+            *COUNT += 1;
+            // Finished fade-on cycle of the active LED. Start fading on the next LED, which will
+            // also fade out the currently-active LED.
+            if *COUNT == FADE_IN_DURATION {
+                ACTIVE_LED.rotate_active_led();
+                ACTIVE_LED.reset_duty();
+                *COUNT = 0
             }
-            if GAMMA[ACTIVE_LED.prev_led_duty().round() as usize] != 0 {
+
+            // Update duty cycles
+            if ACTIVE_LED.duty() != 0 {
+                state.leds[ACTIVE_LED.index()].set_high().ok();
+            }
+            if ACTIVE_LED.prev_led_duty() != 0 {
                 state.leds[ACTIVE_LED.prev_led_idx()].set_high().ok();
             }
+            tim2.ccr1
+                .write(|w| w.ccr().bits(ACTIVE_LED.duty() * period / 255));
+            tim2.ccr2
+                .write(|w| w.ccr().bits(ACTIVE_LED.prev_led_duty() * period / 255));
+
+            // TODO: calculate this as a constant
+            let duty_step: f32 = 255.0 / (FADE_IN_DURATION as f32);
+            ACTIVE_LED.step_duty(duty_step);
         }
 
-        if t == GAMMA[ACTIVE_LED.duty().round() as usize] {
-            state.leds[ACTIVE_LED.index].set_low().ok();
+        // Compare 1 interrupt: duty cycle for active LED
+        if tim2.sr.read().cc1if().bit_is_set() {
+            tim2.sr.modify(|_, w| w.cc1if().clear());
+            state.leds[ACTIVE_LED.index()].set_low().ok();
         }
-        if t == GAMMA[ACTIVE_LED.prev_led_duty().round() as usize] {
+
+        // Compare 2 interrupt: duty cycle for previously-active LED
+        if tim2.sr.read().cc2if().bit_is_set() {
+            tim2.sr.modify(|_, w| w.cc2if().clear());
             state.leds[ACTIVE_LED.prev_led_idx()].set_low().ok();
         }
-        state.timer.clear_update_interrupt_flag();
     });
-
-    // Finished fading in the active LED. Time to start fading it out and fading in the next LED
-    if *COUNT == FADE_IN_DURATION {
-        ACTIVE_LED.index += 1;
-        if ACTIVE_LED.index == 8 {
-            ACTIVE_LED.index = 0;
-        }
-        ACTIVE_LED.duty_cycle = 0.0;
-        *COUNT = 0
-    }
 }

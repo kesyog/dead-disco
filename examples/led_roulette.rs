@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-
+/// LED roulette example. Turns on the compass LED's in sequence with some overlap.
 use core::iter::Iterator;
 use cortex_m_rt::entry;
 use dead_disco::leds::DiscoLeds;
